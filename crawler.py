@@ -8,6 +8,7 @@ from time import sleep
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from html_to_md import parse_to_markdown as subroutine
+from Queue_with_qsize import MyQueue
 
 load_dotenv()
 
@@ -19,14 +20,17 @@ class Test:
         supabase_url = os.environ.get('PENGUINAI_SUPABASE_URL')
         supabase_key = os.environ.get('PENGUINAI_SUPABASE_KEY')
 
-        self.mp_manager = None
-        self.lock = None
+        self.mp_manager = multiprocessing.Manager()
+        self.urls_lock = self.mp_manager.Lock()
+        self.markup_lock = self.mp_manager.Lock()
         self.mpexecutor = None
         self.executor = None 
-        self.thread_futures = []
-        self.process_futures = []
+        self.thread_futures = {}
+        self.process_futures = {}
+        self.markup_queue = MyQueue()
         self.base_url = url
-        self.urls_to_visit = [url]
+        self.urls_to_visit = self.mp_manager.list([url])
+
         # self.supabase = create_client(supabase_url, supabase_key)
 
     def remove_done_future(self, future):
@@ -37,28 +41,31 @@ class Test:
     def start(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             with concurrent.futures.ProcessPoolExecutor(max_workers=8) as mpexecutor:
-                with multiprocessing.Manager() as mp_manager:
-                    self.executor = executor
-                    self.mpexecutor = mpexecutor
-                    self.mp_manager = mp_manager
-                    self.lock = mp_manager.Lock()
-                    self.urls_to_visit = mp_manager.list()
-                    i = 0
-                    while (i <= (len(self.urls_to_visit) - 1) or
-                           len(self.thread_futures) > 0 or
-                           len(self.process_futures) > 0):
-                        iteration_url = self.urls_to_visit[i]
-                        i += 1
-                        thread_future = self.executor.submit(self.get_markup, iteration_url)
-                        self.thread_futures.append(thread_future)
-                        response = thread_future.result()
-                        process_future = self.mpexecutor.submit(subroutine, self.base_url, iteration_url, response)
-                        self.process_futures.append(process_future)
-                        links, markdown = process_future.result()
-                        for link in links:
-                            if link not in self.urls_to_visit:
-                                self.urls_to_visit.append(link)
-                        print('finished loop', markdown)
+                self.executor = executor
+                self.mpexecutor = mpexecutor
+                i = 0
+                while (i <= (len(self.urls_to_visit) - 1) or
+                        len(self.thread_futures) > 0 or
+                        len(self.process_futures) > 0 or
+                        self.markup_queue.qsize() > 0):
+                    if (i <= (len(self.urls_to_visit) - 1)):
+                        for path in self.urls_to_visit[i::]:
+                            i += 1
+                            thread_future = self.executor.submit(self.get_markup, path)
+                            self.thread_futures[thread_future] = {'future': thread_future, 'path': path}
+
+                    done_threads, not_done_threads = concurrent.futures.wait(self.thread_futures, .1, concurrent.futures.FIRST_COMPLETED)
+                    for future in done_threads:
+                        path = self.thread_futures[future]['path']
+                        process_future = self.mpexecutor.submit(subroutine, self.base_url, path, self.markup_queue.get(), self.urls_to_visit, self.urls_lock, [])
+                        self.process_futures[process_future] = {'future': process_future, 'path': path}
+                        del self.thread_futures[future]
+
+                    done_processes, not_done_processes = concurrent.futures.wait(self.process_futures, .1, concurrent.futures.FIRST_COMPLETED)
+                    for future in done_processes:
+                        print('finished inner processing loop iteration')
+                        del self.process_futures[future]
+
 
     def prepend_base_url(self, path):
         if re.match('^/', path):
@@ -67,10 +74,12 @@ class Test:
             return path
 
     def get_markup(self, url):
-        print(f'START: request {url}')
+        print(f'START: request {url}', flush=True)
         response = requests.get(self.prepend_base_url(url))
-        print(f'END: request {url}')
-        return response
+        self.markup_lock.acquire()
+        self.markup_queue.put(response)
+        self.markup_lock.release()
+        print(f'END: request {url}', flush=True)
 
 def main(url=None):
     test_spawner = Test('https://www.brex.com')
