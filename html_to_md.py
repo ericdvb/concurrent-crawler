@@ -3,7 +3,7 @@ from time import sleep
 import html2text
 from bs4 import BeautifulSoup, NavigableString
 
-def parse_to_markdown(base_url, path, response, urls_to_visit, urls_lock, avoid_list=[]):
+def parse_to_markdown(base_url, path, response, urls_to_visit, urls_lock, markdown_queue, markdown_lock, avoid_list=[]):
     result_string = f'subprocess with path: {path}'
     print(result_string)
     parsed = BeautifulSoup(response.text, "html.parser")
@@ -49,8 +49,11 @@ def parse_to_markdown(base_url, path, response, urls_to_visit, urls_lock, avoid_
 
     markdown_result = html2text.html2text(parsed.prettify())
 
-    with open(f'{path.replace("/", "_")}', "a+") as f:
-        print('writing file', flush=True)
-        f.write(markdown_result)
-        print('file written', flush=True)
-    return (links, result_string)
+    ### Use the following if you want to write results to local files instead of supabase
+    # with open(f'{path.replace("/", "_")}', "a+") as f:
+        # print('writing file', flush=True)
+        # f.write(markdown_result)
+        # print('file written', flush=True)
+    markdown_lock.acquire()
+    markdown_queue.put({ 'markdown': markdown_result, 'base_url': base_url, 'path': path })
+    markdown_lock.release()
